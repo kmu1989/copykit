@@ -1,116 +1,115 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Reflection;
+using System.Linq;
 
 namespace Common.Helpers
 {
     /// <summary>
-    /// DataTable / DataRow 를 모델 클래스로 매핑하는 헬퍼.
+    /// DataTable 을 모델 클래스 리스트로 매핑하는 헬퍼.
     ///
     /// 매칭 규칙: 컬럼명과 프로퍼티명이 "정확히 일치"해야 매핑됩니다.
-    ///           (대소문자 무시 — DataTable.Columns 기본 동작)
+    ///           (대소문자 무시 — StringComparer.OrdinalIgnoreCase)
     ///           이름이 다르면 매핑되지 않으므로, 쿼리 별칭(AS) 또는 프로퍼티명을 맞추세요.
     ///
-    /// 처리: DBNull, Nullable(int? 등), Enum, Guid 변환.
+    /// 처리: DBNull, Nullable(int? 등), Enum 변환.
     /// 외부 라이브러리(Dapper 등) 없이 BCL Reflection 만 사용.
     ///
-    /// 복사 시 주의: ToList/ToModel 은 내부 private 메서드(ConvertValue)에 의존합니다.
-    ///              떼어갈 때 이 클래스 전체를 가져가세요.
+    /// 사용 예제:
+    /// <code>
+    /// // 1) 모델 정의 — 프로퍼티명을 컬럼명과 맞춥니다.
+    /// public class User
+    /// {
+    ///     public int      Id     { get; set; }
+    ///     public string   Name   { get; set; }
+    ///     public int?     Age    { get; set; }   // Nullable 지원
+    ///     public Gender   Gender { get; set; }   // Enum 지원
+    /// }
+    ///
+    /// // 2) 호출 — DataTable 을 List&lt;User&gt; 로 변환
+    /// DataTable dt = dataAccess.GetUsers();          // SELECT Id, Name, Age, Gender FROM Users
+    /// List&lt;User&gt; users = DataTableMapper.ConvertToList&lt;User&gt;(dt);
+    ///
+    /// // 3) 변환 후 활용 (LINQ)
+    /// User first   = users.FirstOrDefault();                       // 첫 행
+    /// User byId    = users.Find(u =&gt; u.Id == 100);                 // 단건 조회
+    /// List&lt;User&gt; adults = users.FindAll(u =&gt; u.Age &gt;= 18);         // 조건 필터(여러 건)
+    /// List&lt;User&gt; sorted = users.OrderBy(u =&gt; u.Name).ToList();      // 정렬
+    /// int count = users.Count;                                      // 건수
+    /// </code>
     /// </summary>
     public static class DataTableMapper
     {
         /// <summary>
         /// DataTable -> List&lt;T&gt;. T 는 매개변수 없는 생성자가 필요합니다.
         /// </summary>
-        public static List<T> ToList<T>(DataTable table) where T : new()
+        public static List<T> ConvertToList<T>(DataTable dt) where T : new()
         {
-            var result = new List<T>();
-            if (table == null || table.Rows.Count == 0) return result;
+            var list = new List<T>();
 
-            PropertyInfo[] props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            if (dt == null || dt.Rows.Count == 0)
+                return list;
 
-            foreach (DataRow row in table.Rows)
+            var properties = typeof(T).GetProperties();
+
+            // .NET Framework 4.5 호환 버전
+            var columns = new HashSet<string>(
+                dt.Columns
+                  .Cast<DataColumn>()
+                  .Select(c => c.ColumnName),
+                StringComparer.OrdinalIgnoreCase);
+
+            // .NET Framework 4.7.2+ / .NET Core(Standard 2.1) 버전
+            // (ToHashSet 확장 메서드는 4.7.2 이상에서만 제공)
+            //var columns = dt.Columns
+            //                .Cast<DataColumn>()
+            //                .Select(c => c.ColumnName)
+            //                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (DataRow row in dt.Rows)
             {
-                result.Add(MapRow<T>(row, props));
+                var obj = new T();
+
+                foreach (var prop in properties)
+                {
+                    if (!prop.CanWrite)
+                        continue;
+
+                    if (!columns.Contains(prop.Name))
+                        continue;
+
+                    var value = row[prop.Name];
+
+                    if (value == DBNull.Value)
+                        continue;
+
+                    var targetType =
+                        Nullable.GetUnderlyingType(prop.PropertyType)
+                        ?? prop.PropertyType;
+
+                    object convertedValue;
+
+                    if (targetType.IsEnum)
+                    {
+                        convertedValue = Enum.Parse(
+                            targetType,
+                            value.ToString(),
+                            true);
+                    }
+                    else
+                    {
+                        convertedValue = Convert.ChangeType(
+                            value,
+                            targetType);
+                    }
+
+                    prop.SetValue(obj, convertedValue, null);
+                }
+
+                list.Add(obj);
             }
-            return result;
-        }
 
-        /// <summary>
-        /// DataRow 한 건 -> 모델 객체.
-        /// </summary>
-        public static T ToModel<T>(DataRow row) where T : new()
-        {
-            if (row == null) return new T();
-            PropertyInfo[] props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
-            return MapRow<T>(row, props);
-        }
-
-        // ----- 내부 구현 -----
-
-        private static T MapRow<T>(DataRow row, PropertyInfo[] props) where T : new()
-        {
-            var item = new T();
-            DataColumnCollection columns = row.Table.Columns;
-
-            foreach (PropertyInfo prop in props)
-            {
-                if (!prop.CanWrite) continue;
-                if (!columns.Contains(prop.Name)) continue; // 정확 매칭 (대소문자 무시)
-
-                object raw = row[prop.Name];
-                if (raw == null || raw == DBNull.Value) continue; // 기본값 유지
-
-                object converted;
-                if (ConvertValue(raw, prop.PropertyType, out converted))
-                {
-                    prop.SetValue(item, converted, null);
-                }
-                // 변환 실패 시: 기본값 유지(예외 없음). 엄격 모드가 필요하면 여기서 throw 하세요.
-            }
-            return item;
-        }
-
-        /// <summary>
-        /// raw 값을 targetType 으로 변환. 성공 여부를 반환.
-        /// Nullable, Enum, Guid, 일반 IConvertible 을 처리.
-        /// </summary>
-        private static bool ConvertValue(object raw, Type targetType, out object converted)
-        {
-            converted = null;
-            try
-            {
-                Type underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
-
-                if (underlying == typeof(string))
-                {
-                    converted = raw.ToString();
-                }
-                else if (underlying.IsEnum)
-                {
-                    converted = raw is string
-                        ? Enum.Parse(underlying, (string)raw, true)
-                        : Enum.ToObject(underlying, raw);
-                }
-                else if (underlying == typeof(Guid))
-                {
-                    converted = raw is Guid ? raw : Guid.Parse(raw.ToString());
-                }
-                else if (underlying.IsAssignableFrom(raw.GetType()))
-                {
-                    converted = raw; // 이미 호환 타입
-                }
-                else
-                {
-                    converted = Convert.ChangeType(raw, underlying);
-                }
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
+            return list;
         }
     }
 }
